@@ -46,8 +46,7 @@
 1. **峰值聚合带宽: 77.1 GB/s (90.9%)** — 384MB, ratio 0.1, 4次重复波动 < 1.6%
 2. **GPU 并发带宽恒定 ~27 GB/s** — 不随数据量/ratio 变化，并发时从 52→27 下降 48%
 3. **NPU 受 GPU 竞争影响较小** — 并发时从 54→50 仅下降 7% (ratio 0.1)
-4. **竞争因子 0.60-0.64** — 与数据量无关，是硬件级别的内存通道竞争
-5. **384MB 比 256MB 略好** — 约高 1 GB/s，dispatch 开销被更好地 amortize
+4. **384MB 比 256MB 略好** — 约高 1 GB/s，dispatch 开销被更好地 amortize
 6. **低 GPU ratio 聚合更高** — 因为 GPU 带宽固定，减少 GPU 份额可减轻对 NPU 的竞争
 7. **与 HeteroInfer 96% 的差距** — 可能源于 Gen 5 内存控制器差异或 QNN/OpenCL dispatch 开销
 
@@ -268,7 +267,6 @@ aggregate = bandwidth_gpu_concurrent + bandwidth_npu_concurrent
 **对比指标**：
 ```
 聚合利用率 = aggregate / 84.8 GB/s
-竞争因子   = aggregate / (solo_gpu + solo_npu)    // < 1.0 表示有竞争
 Overlap    = (T_gpu + T_npu - T_wall) / min(T_gpu, T_npu)   // ~100% 表示真并发
 ```
 
@@ -348,7 +346,6 @@ export ADSP_LIBRARY_PATH=${HTP_DIR}
 | NPU only  |     --    |     53.01 |   53.01 |  62.5%  |
 | 并发      |     26.52 |     50.21 |   76.73 |  90.5%  |
 +-----------+-----------+-----------+---------+---------+
-竞争因子: 0.73 (76.73 / 105.22)
 ```
 
 ## 代码来源
@@ -377,7 +374,7 @@ export ADSP_LIBRARY_PATH=${HTP_DIR}
 1. `--mode gpu` → GPU 单独基线 52.1-52.4 GB/s (61-62%)
 2. `--mode npu` → NPU 单独基线 52.9-54.1 GB/s (62-64%)
 3. `--mode concurrent --gpu-ratio 0.1` → 聚合 77.1 GB/s (90.9%)
-4. `--mode all` → 完整对比表，竞争因子 0.60-0.64
+4. `--mode all` → 完整对比表
 5. ratio 0.1-0.5 扫描完成，最优 ratio ≈ 0.1（GPU 固定 ~27 GB/s，尽量减少对 NPU 的干扰）
 6. 4 次重复测试波动 < 1.6%，无热降频影响
 
