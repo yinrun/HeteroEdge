@@ -125,7 +125,7 @@ bool createRegisteredBuffer(const QNN_INTERFACE_VER_TYPE& qnnInterface,
   memDesc.memShape.numDim      = numDims;
   memDesc.memShape.dimSize     = const_cast<uint32_t*>(dims);
   memDesc.memShape.shapeConfig = nullptr;
-  memDesc.dataType             = QNN_DATATYPE_INT_8;
+  memDesc.dataType             = QNN_DATATYPE_UFIXED_POINT_8;
   memDesc.memType              = QNN_MEM_TYPE_ION;
   memDesc.ionInfo.fd           = out.fd;
 
@@ -325,7 +325,10 @@ Qnn_Tensor_t makeTensor(const char* name,
   tensor.v1.type      = type;
   tensor.v1.dataFormat     = QNN_TENSOR_DATA_FORMAT_FLAT_BUFFER;
   tensor.v1.dataType       = dataType;
-  tensor.v1.quantizeParams = QNN_QUANTIZE_PARAMS_INIT;
+  tensor.v1.quantizeParams.encodingDefinition = QNN_DEFINITION_DEFINED;
+  tensor.v1.quantizeParams.quantizationEncoding = QNN_QUANTIZATION_ENCODING_SCALE_OFFSET;
+  tensor.v1.quantizeParams.scaleOffsetEncoding.scale = 1.0f;
+  tensor.v1.quantizeParams.scaleOffsetEncoding.offset = 0;
   tensor.v1.rank           = kTensorRank;
   tensor.v1.dimensions     = dims;
   tensor.v1.memType        = QNN_TENSORMEMTYPE_RAW;
@@ -450,11 +453,11 @@ int main() {
     outputNames.emplace_back("output_" + std::to_string(i));
 
     input0s.push_back(
-        makeTensor(input0Names.back().c_str(), QNN_TENSOR_TYPE_APP_WRITE, QNN_DATATYPE_INT_8, dims));
+        makeTensor(input0Names.back().c_str(), QNN_TENSOR_TYPE_APP_WRITE, QNN_DATATYPE_UFIXED_POINT_8, dims));
     input1s.push_back(
-        makeTensor(input1Names.back().c_str(), QNN_TENSOR_TYPE_APP_WRITE, QNN_DATATYPE_INT_8, dims));
+        makeTensor(input1Names.back().c_str(), QNN_TENSOR_TYPE_APP_WRITE, QNN_DATATYPE_UFIXED_POINT_8, dims));
     outputs.push_back(
-        makeTensor(outputNames.back().c_str(), QNN_TENSOR_TYPE_APP_READ, QNN_DATATYPE_INT_8, dims));
+        makeTensor(outputNames.back().c_str(), QNN_TENSOR_TYPE_APP_READ, QNN_DATATYPE_UFIXED_POINT_8, dims));
 
     if (!checkStatus(qnn.tensorCreateGraphTensor(graphHandle, &input0s.back()),
                      "createGraphTensor input0") ||
