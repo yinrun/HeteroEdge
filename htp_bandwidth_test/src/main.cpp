@@ -2,13 +2,11 @@
 #include <dlfcn.h>
 #include <stdint.h>
 
-#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
-#include <string>
 #include <vector>
 
 #include "QNN/QnnBackend.h"
@@ -24,16 +22,13 @@
 #include "QNN/HTP/QnnHtpPerfInfrastructure.h"
 
 namespace {
-constexpr uint32_t kTotalElements = 128u * 1024u * 1024u; // 128MB for int8.
-constexpr uint32_t kTileElements  = 32u * 1024u * 1024u;  // 16MB tile for HTP.
-constexpr uint32_t kBatchSize     = 32;
+// Single-node bandwidth test: 2 inputs + 1 output, layout [128, 1, 1, 1048576]
+constexpr uint32_t kBatchSize     = 128;
+constexpr uint32_t kHeight        = 1;
+constexpr uint32_t kWidth         = 1;
+constexpr uint32_t kChannels      = 1048576;
+constexpr uint32_t kTotalElements = kBatchSize * kHeight * kWidth * kChannels; // 128MB
 constexpr uint32_t kTensorRank    = 4;
-static_assert(kTileElements % kBatchSize == 0, "kTileElements must be divisible by batch size");
-constexpr uint32_t kTileElementsPerBatch = kTileElements / kBatchSize;
-constexpr uint32_t kHeight   = 1;
-constexpr uint32_t kWidth    = 1;
-constexpr uint32_t kChannels = kTileElementsPerBatch;
-static_assert(kChannels * kHeight * kWidth == kTileElementsPerBatch, "Invalid NHWC dims");
 
 bool checkStatus(Qnn_ErrorHandle_t status, const char* what) {
   if (status != QNN_SUCCESS) {
@@ -412,146 +407,102 @@ int main() {
     return cleanupAndExit(qnn, backendHandle, deviceHandle, contextHandle, backendLibHandle, true, true);
   }
 
-  // Explicit NHWC layout: [N, H, W, C]
+  // Single-node layout: [N, H, W, C]
   uint32_t dims[kTensorRank] = {kBatchSize, kHeight, kWidth, kChannels};
+  const size_t totalBytes = static_cast<size_t>(kTotalElements) * sizeof(int8_t);
 
-  const uint32_t numTiles = kTotalElements / kTileElements;
-  const size_t tileBytes = static_cast<size_t>(kTileElements) * sizeof(int8_t);
-  std::vector<RegisteredBuffer> input0Buffers;
-  std::vector<RegisteredBuffer> input1Buffers;
-  std::vector<RegisteredBuffer> outputBuffers;
-  input0Buffers.resize(numTiles);
-  input1Buffers.resize(numTiles);
-  outputBuffers.resize(numTiles);
-  for (uint32_t i = 0; i < numTiles; ++i) {
-    if (!createRegisteredBuffer(qnn, contextHandle, dims, kTensorRank, tileBytes, 1, input0Buffers[i]) ||
-        !createRegisteredBuffer(qnn, contextHandle, dims, kTensorRank, tileBytes, 2, input1Buffers[i]) ||
-        !createRegisteredBuffer(qnn, contextHandle, dims, kTensorRank, tileBytes, 0, outputBuffers[i])) {
-      releaseRegisteredBuffers(qnn, input0Buffers);
-      releaseRegisteredBuffers(qnn, input1Buffers);
-      releaseRegisteredBuffers(qnn, outputBuffers);
-      return cleanupAndExit(qnn, backendHandle, deviceHandle, contextHandle, backendLibHandle, true, true);
-    }
-  }
-  std::vector<Qnn_Tensor_t> input0s;
-  std::vector<Qnn_Tensor_t> input1s;
-  std::vector<Qnn_Tensor_t> outputs;
-  input0s.reserve(numTiles);
-  input1s.reserve(numTiles);
-  outputs.reserve(numTiles);
+  std::cout << "[QNN] Single-node dims: [" << kBatchSize << ", " << kHeight
+            << ", " << kWidth << ", " << kChannels << "]"
+            << "  totalBytes=" << totalBytes << std::endl;
 
-  std::vector<std::string> input0Names;
-  std::vector<std::string> input1Names;
-  std::vector<std::string> outputNames;
-  input0Names.reserve(numTiles);
-  input1Names.reserve(numTiles);
-  outputNames.reserve(numTiles);
+  // Allocate 3 registered buffers: input0, input1, output
+  RegisteredBuffer input0Buf, input1Buf, outputBuf;
 
-  for (uint32_t i = 0; i < numTiles; ++i) {
-    input0Names.emplace_back("input0_" + std::to_string(i));
-    input1Names.emplace_back("input1_" + std::to_string(i));
-    outputNames.emplace_back("output_" + std::to_string(i));
+  auto cleanup = [&]() {
+    std::vector<RegisteredBuffer> bufs;
+    if (input0Buf.data) bufs.push_back(input0Buf);
+    if (input1Buf.data) bufs.push_back(input1Buf);
+    if (outputBuf.data) bufs.push_back(outputBuf);
+    releaseRegisteredBuffers(qnn, bufs);
+  };
 
-    input0s.push_back(
-        makeTensor(input0Names.back().c_str(), QNN_TENSOR_TYPE_APP_WRITE, QNN_DATATYPE_UFIXED_POINT_8, dims));
-    input1s.push_back(
-        makeTensor(input1Names.back().c_str(), QNN_TENSOR_TYPE_APP_WRITE, QNN_DATATYPE_UFIXED_POINT_8, dims));
-    outputs.push_back(
-        makeTensor(outputNames.back().c_str(), QNN_TENSOR_TYPE_APP_READ, QNN_DATATYPE_UFIXED_POINT_8, dims));
-
-    if (!checkStatus(qnn.tensorCreateGraphTensor(graphHandle, &input0s.back()),
-                     "createGraphTensor input0") ||
-        !checkStatus(qnn.tensorCreateGraphTensor(graphHandle, &input1s.back()),
-                     "createGraphTensor input1") ||
-        !checkStatus(qnn.tensorCreateGraphTensor(graphHandle, &outputs.back()),
-                     "createGraphTensor output")) {
-      releaseRegisteredBuffers(qnn, input0Buffers);
-      releaseRegisteredBuffers(qnn, input1Buffers);
-      releaseRegisteredBuffers(qnn, outputBuffers);
-      return cleanupAndExit(qnn, backendHandle, deviceHandle, contextHandle, backendLibHandle, true, true);
-    }
-  }
-
-  std::vector<std::array<Qnn_Tensor_t, 2>> opInputs;
-  std::vector<std::array<Qnn_Tensor_t, 1>> opOutputs;
-  std::vector<std::string> opNames;
-  std::vector<Qnn_OpConfig_t> addConfigs;
-  opInputs.reserve(numTiles);
-  opOutputs.reserve(numTiles);
-  opNames.reserve(numTiles);
-  addConfigs.reserve(numTiles);
-  for (uint32_t i = 0; i < numTiles; ++i) {
-    opInputs.push_back({input0s[i], input1s[i]});
-    opOutputs.push_back({outputs[i]});
-    opNames.emplace_back("elementwise_add_" + std::to_string(i));
-
-    Qnn_OpConfig_t addConfig = QNN_OPCONFIG_INIT;
-    addConfig.version        = QNN_OPCONFIG_VERSION_1;
-    addConfig.v1.name         = opNames.back().c_str();
-    addConfig.v1.packageName  = QNN_OP_PACKAGE_NAME_QTI_AISW;
-    addConfig.v1.typeName     = QNN_OP_ELEMENT_WISE_ADD;
-    addConfig.v1.numOfParams  = 0;
-    addConfig.v1.params       = nullptr;
-    addConfig.v1.numOfInputs  = 2;
-    addConfig.v1.inputTensors = opInputs.back().data();
-    addConfig.v1.numOfOutputs = 1;
-    addConfig.v1.outputTensors = opOutputs.back().data();
-    addConfigs.push_back(addConfig);
-  }
-
-  for (uint32_t i = 0; i < numTiles; ++i) {
-    if (!checkStatus(qnn.graphAddNode(graphHandle, addConfigs[i]),
-                     "graphAddNode add")) {
-      releaseRegisteredBuffers(qnn, input0Buffers);
-      releaseRegisteredBuffers(qnn, input1Buffers);
-      releaseRegisteredBuffers(qnn, outputBuffers);
-      return cleanupAndExit(qnn, backendHandle, deviceHandle, contextHandle, backendLibHandle, true, true);
-    }
-  }
-
-  if (!checkStatus(qnn.graphFinalize(graphHandle, nullptr, nullptr), "graphFinalize")) {
-    releaseRegisteredBuffers(qnn, input0Buffers);
-    releaseRegisteredBuffers(qnn, input1Buffers);
-    releaseRegisteredBuffers(qnn, outputBuffers);
+  if (!createRegisteredBuffer(qnn, contextHandle, dims, kTensorRank, totalBytes, 1, input0Buf) ||
+      !createRegisteredBuffer(qnn, contextHandle, dims, kTensorRank, totalBytes, 2, input1Buf) ||
+      !createRegisteredBuffer(qnn, contextHandle, dims, kTensorRank, totalBytes, 0, outputBuf)) {
+    cleanup();
     return cleanupAndExit(qnn, backendHandle, deviceHandle, contextHandle, backendLibHandle, true, true);
   }
 
-  std::vector<Qnn_Tensor_t> execInputs;
-  std::vector<Qnn_Tensor_t> execOutputs;
-  execInputs.reserve(numTiles * 2);
-  execOutputs.reserve(numTiles);
+  // Create graph tensors (1 Add node: 2 inputs + 1 output)
+  Qnn_Tensor_t input0Tensor = makeTensor("input0", QNN_TENSOR_TYPE_APP_WRITE,
+                                          QNN_DATATYPE_UFIXED_POINT_8, dims);
+  Qnn_Tensor_t input1Tensor = makeTensor("input1", QNN_TENSOR_TYPE_APP_WRITE,
+                                          QNN_DATATYPE_UFIXED_POINT_8, dims);
+  Qnn_Tensor_t outputTensor = makeTensor("output", QNN_TENSOR_TYPE_APP_READ,
+                                          QNN_DATATYPE_UFIXED_POINT_8, dims);
 
-  for (uint32_t tile = 0; tile < numTiles; ++tile) {
-    Qnn_Tensor_t in0 = input0s[tile];
-    in0.v1.memType   = QNN_TENSORMEMTYPE_MEMHANDLE;
-    in0.v1.memHandle = input0Buffers[tile].memHandle;
-
-    Qnn_Tensor_t in1 = input1s[tile];
-    in1.v1.memType   = QNN_TENSORMEMTYPE_MEMHANDLE;
-    in1.v1.memHandle = input1Buffers[tile].memHandle;
-
-    Qnn_Tensor_t out = outputs[tile];
-    out.v1.memType   = QNN_TENSORMEMTYPE_MEMHANDLE;
-    out.v1.memHandle = outputBuffers[tile].memHandle;
-
-    execInputs.push_back(in0);
-    execInputs.push_back(in1);
-    execOutputs.push_back(out);
+  if (!checkStatus(qnn.tensorCreateGraphTensor(graphHandle, &input0Tensor),
+                   "createGraphTensor input0") ||
+      !checkStatus(qnn.tensorCreateGraphTensor(graphHandle, &input1Tensor),
+                   "createGraphTensor input1") ||
+      !checkStatus(qnn.tensorCreateGraphTensor(graphHandle, &outputTensor),
+                   "createGraphTensor output")) {
+    cleanup();
+    return cleanupAndExit(qnn, backendHandle, deviceHandle, contextHandle, backendLibHandle, true, true);
   }
+
+  // Single Add op
+  Qnn_Tensor_t opInputs[2]  = {input0Tensor, input1Tensor};
+  Qnn_Tensor_t opOutputs[1] = {outputTensor};
+
+  Qnn_OpConfig_t addConfig = QNN_OPCONFIG_INIT;
+  addConfig.version         = QNN_OPCONFIG_VERSION_1;
+  addConfig.v1.name         = "elementwise_add";
+  addConfig.v1.packageName  = QNN_OP_PACKAGE_NAME_QTI_AISW;
+  addConfig.v1.typeName     = QNN_OP_ELEMENT_WISE_ADD;
+  addConfig.v1.numOfParams  = 0;
+  addConfig.v1.params       = nullptr;
+  addConfig.v1.numOfInputs  = 2;
+  addConfig.v1.inputTensors = opInputs;
+  addConfig.v1.numOfOutputs = 1;
+  addConfig.v1.outputTensors = opOutputs;
+
+  if (!checkStatus(qnn.graphAddNode(graphHandle, addConfig), "graphAddNode add")) {
+    cleanup();
+    return cleanupAndExit(qnn, backendHandle, deviceHandle, contextHandle, backendLibHandle, true, true);
+  }
+
+  std::cout << "[QNN] graphFinalize starting..." << std::endl;
+  if (!checkStatus(qnn.graphFinalize(graphHandle, nullptr, nullptr), "graphFinalize")) {
+    cleanup();
+    return cleanupAndExit(qnn, backendHandle, deviceHandle, contextHandle, backendLibHandle, true, true);
+  }
+  std::cout << "[QNN] graphFinalize succeeded" << std::endl;
+
+  // Prepare execution tensors with registered mem handles
+  Qnn_Tensor_t execIn0 = input0Tensor;
+  execIn0.v1.memType   = QNN_TENSORMEMTYPE_MEMHANDLE;
+  execIn0.v1.memHandle = input0Buf.memHandle;
+
+  Qnn_Tensor_t execIn1 = input1Tensor;
+  execIn1.v1.memType   = QNN_TENSORMEMTYPE_MEMHANDLE;
+  execIn1.v1.memHandle = input1Buf.memHandle;
+
+  Qnn_Tensor_t execOut = outputTensor;
+  execOut.v1.memType   = QNN_TENSORMEMTYPE_MEMHANDLE;
+  execOut.v1.memHandle = outputBuf.memHandle;
+
+  Qnn_Tensor_t execInputs[2]  = {execIn0, execIn1};
+  Qnn_Tensor_t execOutputs[1] = {execOut};
 
   // Warmup (3 runs)
   for (int w = 0; w < 3; ++w) {
     if (!checkStatus(qnn.graphExecute(graphHandle,
-                                      execInputs.data(),
-                                      static_cast<uint32_t>(execInputs.size()),
-                                      execOutputs.data(),
-                                      static_cast<uint32_t>(execOutputs.size()),
-                                      nullptr,
-                                      nullptr),
+                                      execInputs, 2,
+                                      execOutputs, 1,
+                                      nullptr, nullptr),
                      "graphExecute warmup")) {
-      releaseRegisteredBuffers(qnn, input0Buffers);
-      releaseRegisteredBuffers(qnn, input1Buffers);
-      releaseRegisteredBuffers(qnn, outputBuffers);
+      cleanup();
       return cleanupAndExit(qnn, backendHandle, deviceHandle, contextHandle, backendLibHandle, true, true);
     }
   }
@@ -562,17 +513,12 @@ int main() {
   for (int run = 0; run < kNumRuns; ++run) {
     const auto t0 = std::chrono::steady_clock::now();
     const auto execStatus = qnn.graphExecute(graphHandle,
-                                             execInputs.data(),
-                                             static_cast<uint32_t>(execInputs.size()),
-                                             execOutputs.data(),
-                                             static_cast<uint32_t>(execOutputs.size()),
-                                             nullptr,
-                                             nullptr);
+                                             execInputs, 2,
+                                             execOutputs, 1,
+                                             nullptr, nullptr);
     const auto t1 = std::chrono::steady_clock::now();
     if (!checkStatus(execStatus, "graphExecute")) {
-      releaseRegisteredBuffers(qnn, input0Buffers);
-      releaseRegisteredBuffers(qnn, input1Buffers);
-      releaseRegisteredBuffers(qnn, outputBuffers);
+      cleanup();
       return cleanupAndExit(qnn, backendHandle, deviceHandle, contextHandle, backendLibHandle, true, true);
     }
     double runMs = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(t1 - t0).count();
@@ -580,37 +526,31 @@ int main() {
     std::cout << "  run " << (run + 1) << ": " << runMs << " ms" << std::endl;
   }
   const double avgMs = totalMs / kNumRuns;
-  const double perTileMs = avgMs / static_cast<double>(numTiles);
   const double totalDataBytes =
       static_cast<double>(kTotalElements) * sizeof(int8_t) * 3.0;  // inA + inB + out
   const double bandwidthGBps =
       (totalDataBytes / (1024.0 * 1024.0 * 1024.0)) / (avgMs / 1000.0);
 
+  // Verify correctness: 1 + 2 = 3
   int maxError = 0;
+  auto* outPtr = static_cast<int8_t*>(outputBuf.data);
   const size_t total = static_cast<size_t>(kTotalElements);
   const size_t indices[] = {0, total / 2, total - 1};
   for (size_t idx : indices) {
-    int8_t expected = 3;
-    const size_t tileIndex = idx / kTileElements;
-    const size_t offset    = idx % kTileElements;
-    auto* outPtr = static_cast<int8_t*>(outputBuffers[tileIndex].data);
-    int diff = std::abs(static_cast<int>(outPtr[offset]) - static_cast<int>(expected));
+    int diff = std::abs(static_cast<int>(outPtr[idx]) - 3);
     if (diff > maxError) {
       maxError = diff;
     }
   }
   std::cout << "[QNN] Done. runs=" << kNumRuns
             << " max_error=" << maxError
-            << " sample_out=" << static_cast<int>(
-                   static_cast<int8_t*>(outputBuffers[0].data)[0])
+            << " sample_out=" << static_cast<int>(outPtr[0])
             << " avg_ms=" << avgMs
-            << " per_tile_ms=" << perTileMs
-            << " bandwidth_GBps=" << bandwidthGBps << std::endl;
+            << " bandwidth_GBps=" << bandwidthGBps
+            << " layout=[" << kBatchSize << "," << kHeight
+            << "," << kWidth << "," << kChannels << "]" << std::endl;
 
-
-  releaseRegisteredBuffers(qnn, input0Buffers);
-  releaseRegisteredBuffers(qnn, input1Buffers);
-  releaseRegisteredBuffers(qnn, outputBuffers);
+  cleanup();
   qnn.contextFree(contextHandle, nullptr);
   if (qnn.deviceFree) {
     qnn.deviceFree(deviceHandle);

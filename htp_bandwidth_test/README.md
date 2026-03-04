@@ -4,19 +4,18 @@
 
 - **目标平台**: Snapdragon 8 Gen 5 (Hexagon V81 / SM8850)
 - **测试方法**: 两个 128MB 输入张量 (UFIXED_POINT_8) 逐元素相加，计算有效带宽 (2读 + 1写 = 3x data)
-- **测试结果**: **53.17 GB/s** (3次平均, BURST mode, SDK 2.42)
+- **测试结果**: **53.70 GB/s** (单节点, 3次平均, BURST mode, SDK 2.42)
 
 ## 测试结果
 
 | 指标 | 值 |
 |------|-----|
-| 峰值带宽 | **53.17 GB/s** (3次平均) |
-| 单次最高 | 54.89 GB/s |
-| 数据量 | 128 MB (4 tiles x 32MB) |
+| 峰值带宽 | **53.70 GB/s** (单节点, 3次平均) |
+| 数据量 | 128 MB (单节点) |
 | 有效传输 | 384 MB/次 (2读 + 1写) |
-| 每次延迟 | ~7.05 ms |
+| 每次延迟 | ~6.98 ms |
 | 旧版基线 | 6.42 GB/s |
-| 提升倍数 | **8.3x** |
+| 提升倍数 | **8.4x** |
 
 ## 关键优化点
 
@@ -44,6 +43,23 @@ tensor.v1.quantizeParams.scaleOffsetEncoding.offset = 0;
 ```
 
 **根因**: INT_8 不是 HTP 的原生量化类型，graph compiler 会自动插入 Cast 节点做类型转换，额外的读写开销拉低带宽。
+
+### 3. 单节点替代多 tile (简化结构, 带宽不变)
+
+原方案用 4 个独立 Add 节点 (4 tiles x 32MB, dims `[32,1,1,1M]`)，需要 8 input + 4 output tensor。
+现改为单个 Add 节点 (dims `[128,1,1,1M]`)，只需 2 input + 1 output tensor，带宽从 53.17 → 53.70 GB/s。
+
+**关键发现: C 维度 (channels) 必须 <= 1048576**
+
+| batch | C | 总量 | 带宽 | 说明 |
+|-------|---|------|------|------|
+| 128 | 1M | 128MB | **54.16 GB/s** | 最优 |
+| 64 | 1M | 64MB | **51.86 GB/s** | C=1M 即可 |
+| 64 | 2M | 128MB | 29.53 GB/s | C 翻倍，带宽腰斩 |
+| 32 | 4M | 128MB | 1.37 GB/s | C 太大，tiler 无法有效切分 |
+| 4-tile 基线 | 1M | 128MB | 53.17 GB/s | 旧方案参考 |
+
+**根因**: HTP tiler 在 C 维度上做切分调度。C=1M 时 tiler 能生成高效的执行计划；C>1M 触发 "no valid splitting rule" 后回退到低效策略，严重影响 HVX 并行度。batch 维度本身不是瓶颈，只需保证 C<=1M。
 
 ## 目录结构
 
@@ -74,15 +90,17 @@ export QNN_SDK_ROOT=/path/to/qairt/2.42.0.251225
 [QNN] Using provider API 2.32.0
 [QNN] HTP num_cores=1
 [QNN] HTP num_hvx_threads=8
-  run 1: 7.11 ms
-  run 2: 7.02 ms
-  run 3: 7.03 ms
-[QNN] Done. runs=3 max_error=0 sample_out=3 avg_ms=7.05 per_tile_ms=1.76 bandwidth_GBps=53.17
+[QNN] Single-node dims: [128, 1, 1, 1048576]  totalBytes=134217728
+[QNN] graphFinalize succeeded
+  run 1: 6.93 ms
+  run 2: 7.07 ms
+  run 3: 6.94 ms
+[QNN] Done. runs=3 max_error=0 sample_out=3 avg_ms=6.98 bandwidth_GBps=53.70 layout=[128,1,1,1048576]
 ```
 
 ## 技术细节
 
-- 张量布局: NHWC `[32, 1, 1, C]`，4 tiles x 32MB = 128MB 总数据
+- 张量布局: NHWC `[128, 1, 1, 1048576]`，单节点 128MB (C<=1M 是关键)
 - 数据类型: `UFIXED_POINT_8` (scale=1.0, offset=0)，HTP 原生量化类型
 - 内存分配: `rpcmem_alloc` (heapid=25) + `QnnMem_register` (ION zero-copy)
 - 性能模式: DCVS 禁用, MAX 电压角 (bus+core), HMX V2 MAX, sleep 禁用
