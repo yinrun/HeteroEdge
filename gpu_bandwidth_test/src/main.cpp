@@ -169,7 +169,7 @@ int main(int argc, char* argv[]) {
 
     // 3. 读取并编译 Kernel
     size_t kernel_source_size = 0;
-    char* kernel_source = read_kernel_source("gpu_bandwidth_test.cl", &kernel_source_size);
+    char* kernel_source = read_kernel_source("kernels/vector_copy.cl", &kernel_source_size);
     if (!kernel_source) {
         printf("错误: 无法读取 kernel 文件\n");
         clReleaseCommandQueue(queue);
@@ -251,9 +251,8 @@ int main(int argc, char* argv[]) {
 
     printf("\n=== 总结 ===\n");
     printf("实际带宽: %.2f GB/s (%.2f MB/s)\n", bandwidth, bandwidth * 1024.0);
-    printf("\n注: Adreno 840 理论内存带宽取决于内存配置:\n");
-    printf("  - LPDDR5 (双通道): 约 51.2 GB/s\n");
-    printf("  - LPDDR5X (双通道): 约 60-80 GB/s\n");
+    printf("\n注: 理论内存带宽 84.8 GB/s (LPDDR5X-5300, 4ch x 16bit)\n");
+    printf("带宽利用率: %.1f%%\n", bandwidth / 84.8 * 100.0);
     printf("实际带宽受内存控制器效率、缓存、系统负载等因素影响\n");
 
     clReleaseKernel(kernel);
