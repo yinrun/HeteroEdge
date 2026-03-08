@@ -37,15 +37,24 @@ IonBuffer g_ionGamma, g_ionBeta;
 
 struct RegMem { Qnn_MemHandle_t handle = nullptr; };
 RegMem g_regInput, g_regOutput;
+RegMem g_regFlag, g_regPollCount;  // for NPU_POLL mode
 
-Qnn_Tensor_t g_execInputs[1];
-Qnn_Tensor_t g_execOutputs[1];
+// For native graph: 1 input, 1 output
+// For flagpoll graph: 3 inputs (data, gamma_static_unused, flag), 2 outputs (result, poll_count)
+// graphExecute uses only APP_WRITE/APP_READ tensors
+Qnn_Tensor_t g_execInputs[2];   // [0]=data, [1]=flag (flagpoll mode)
+Qnn_Tensor_t g_execOutputs[2];  // [0]=result, [1]=poll_count (flagpoll mode)
+uint32_t g_numExecInputs = 1;
+uint32_t g_numExecOutputs = 1;
 
 uint32_t g_dimsIO[kTensorRank];
 uint32_t g_dimsGamma1D[1];
 uint32_t g_dimsAxes[1];
+uint32_t g_dimsFlagIO[kTensorRank] = {1, 1, 1, 1};  // for flag/poll_count tensors
 
 int g_hidden = 0;
+bool g_flagpollMode = false;
+void* g_pollCountPtr = nullptr;  // CPU-mapped pointer to poll_count ION buffer
 
 void qnnLogCallback(const char* fmt, QnnLog_Level_t level,
                      uint64_t /*timestamp*/, va_list args) {
@@ -81,11 +90,14 @@ bool registerBuffer(const IonBuffer& ion, const uint32_t* dims, uint32_t ndims,
 void deregisterAll() {
   if (!g_qnn || !g_qnn->memDeRegister) return;
   std::vector<Qnn_MemHandle_t> handles;
-  if (g_regInput.handle)  handles.push_back(g_regInput.handle);
-  if (g_regOutput.handle) handles.push_back(g_regOutput.handle);
+  if (g_regInput.handle)     handles.push_back(g_regInput.handle);
+  if (g_regOutput.handle)    handles.push_back(g_regOutput.handle);
+  if (g_regFlag.handle)      handles.push_back(g_regFlag.handle);
+  if (g_regPollCount.handle) handles.push_back(g_regPollCount.handle);
   if (!handles.empty())
     g_qnn->memDeRegister(handles.data(), static_cast<uint32_t>(handles.size()));
   g_regInput.handle = g_regOutput.handle = nullptr;
+  g_regFlag.handle = g_regPollCount.handle = nullptr;
 }
 
 void setHighPerformanceMode() {
@@ -234,6 +246,75 @@ bool buildNativeGraph() {
   return true;
 }
 
+Qnn_Tensor_t makeUint32Tensor(const char* name, Qnn_TensorType_t type,
+                               uint32_t* dims, uint32_t rank = kTensorRank) {
+  Qnn_Tensor_t t = QNN_TENSOR_INIT;
+  t.version      = QNN_TENSOR_VERSION_1;
+  t.v1.id        = 0;
+  t.v1.name      = name;
+  t.v1.type      = type;
+  t.v1.dataFormat     = QNN_TENSOR_DATA_FORMAT_FLAT_BUFFER;
+  t.v1.dataType       = QNN_DATATYPE_UINT_32;
+  t.v1.quantizeParams.encodingDefinition   = QNN_DEFINITION_UNDEFINED;
+  t.v1.quantizeParams.quantizationEncoding = QNN_QUANTIZATION_ENCODING_UNDEFINED;
+  t.v1.rank           = rank;
+  t.v1.dimensions     = dims;
+  t.v1.memType        = QNN_TENSORMEMTYPE_RAW;
+  t.v1.clientBuf      = QNN_CLIENT_BUFFER_INIT;
+  return t;
+}
+
+bool buildFlagPollGraph() {
+  // Inputs: data (FP16, APP_WRITE), gamma (FP16, STATIC), flag (UINT32, APP_WRITE)
+  Qnn_Tensor_t input  = makeFp16Tensor("input",  QNN_TENSOR_TYPE_APP_WRITE, g_dimsIO);
+  Qnn_Tensor_t output = makeFp16Tensor("output", QNN_TENSOR_TYPE_APP_READ,  g_dimsIO);
+  Qnn_Tensor_t gamma  = makeFp16Tensor("gamma",  QNN_TENSOR_TYPE_STATIC,    g_dimsGamma1D, 1);
+  gamma.v1.clientBuf.data     = g_ionGamma.ptr;
+  gamma.v1.clientBuf.dataSize = static_cast<uint32_t>(g_ionGamma.size);
+
+  Qnn_Tensor_t flag_in    = makeUint32Tensor("flag",       QNN_TENSOR_TYPE_APP_WRITE, g_dimsFlagIO);
+  Qnn_Tensor_t poll_out   = makeUint32Tensor("poll_count", QNN_TENSOR_TYPE_APP_READ,  g_dimsFlagIO);
+
+  if (!check(g_qnn->tensorCreateGraphTensor(g_graph, &input),    "tensor input") ||
+      !check(g_qnn->tensorCreateGraphTensor(g_graph, &gamma),    "tensor gamma") ||
+      !check(g_qnn->tensorCreateGraphTensor(g_graph, &flag_in),  "tensor flag") ||
+      !check(g_qnn->tensorCreateGraphTensor(g_graph, &output),   "tensor output") ||
+      !check(g_qnn->tensorCreateGraphTensor(g_graph, &poll_out), "tensor poll_count"))
+    return false;
+
+  // Epsilon parameter
+  Qnn_Param_t eps_param = QNN_PARAM_INIT;
+  eps_param.paramType    = QNN_PARAMTYPE_SCALAR;
+  eps_param.name         = "epsilon";
+  eps_param.scalarParam.dataType   = QNN_DATATYPE_FLOAT_32;
+  eps_param.scalarParam.floatValue = 1e-6f;
+
+  Qnn_Param_t params[] = {eps_param};
+  Qnn_Tensor_t opIn[]  = {input, gamma, flag_in};
+  Qnn_Tensor_t opOut[] = {output, poll_out};
+
+  Qnn_OpConfig_t op = QNN_OPCONFIG_INIT;
+  op.version = QNN_OPCONFIG_VERSION_1;
+  op.v1.name = "flagpoll_rmsnorm";
+  op.v1.packageName  = "flagpoll_rmsnorm.HvxOpPackage";
+  op.v1.typeName     = "FlagPollRmsNorm";
+  op.v1.numOfParams  = 1; op.v1.params = params;
+  op.v1.numOfInputs  = 3; op.v1.inputTensors  = opIn;
+  op.v1.numOfOutputs = 2; op.v1.outputTensors = opOut;
+
+  if (!check(g_qnn->graphAddNode(g_graph, op), "graphAddNode(FlagPollRmsNorm)"))
+    return false;
+
+  // Set up execution tensors: APP_WRITE inputs = data + flag, APP_READ outputs = result + poll_count
+  g_execInputs[0]  = input;
+  g_execInputs[1]  = flag_in;
+  g_execOutputs[0] = output;
+  g_execOutputs[1] = poll_out;
+  g_numExecInputs  = 2;
+  g_numExecOutputs = 2;
+  return true;
+}
+
 bool buildGraph() {
   QnnHtpGraph_CustomConfig_t htpCfgs[4] = {QNN_HTP_GRAPH_CUSTOM_CONFIG_INIT,
                                              QNN_HTP_GRAPH_CUSTOM_CONFIG_INIT,
@@ -261,7 +342,8 @@ bool buildGraph() {
   if (!check(g_qnn->graphCreate(g_context, "rmsnorm_graph", graphCfgList, &g_graph), "graphCreate"))
     return false;
 
-  if (!buildNativeGraph()) { g_graph = nullptr; return false; }
+  bool graphOk = g_flagpollMode ? buildFlagPollGraph() : buildNativeGraph();
+  if (!graphOk) { g_graph = nullptr; return false; }
 
   if (!check(g_qnn->graphFinalize(g_graph, nullptr, nullptr), "graphFinalize")) {
     g_graph = nullptr; return false;
@@ -272,7 +354,10 @@ bool buildGraph() {
 }  // namespace
 
 void npu_print_info() {
-  printf("  NPU: Hexagon V81, %u core(s), Native RmsNorm (FP16)\n", g_coreCount);
+  if (g_flagpollMode)
+    printf("  NPU: Hexagon V81, %u core(s), FlagPoll RmsNorm (custom HVX, FP16)\n", g_coreCount);
+  else
+    printf("  NPU: Hexagon V81, %u core(s), Native RmsNorm (FP16)\n", g_coreCount);
 }
 
 bool npu_init(int hidden_dim, float epsilon,
@@ -356,11 +441,124 @@ bool npu_init(int hidden_dim, float epsilon,
   return true;
 }
 
+bool npu_init_flagpoll(int hidden_dim, float epsilon,
+                       const IonBuffer& ion_input, const IonBuffer& ion_output,
+                       const IonBuffer& ion_flag, const IonBuffer& ion_poll_count) {
+  g_flagpollMode = true;
+  g_pollCountPtr = ion_poll_count.ptr;
+  g_hidden = hidden_dim;
+  size_t gamma_bytes = (size_t)hidden_dim * 2;
+
+  g_dimsIO[0] = 1; g_dimsIO[1] = 1; g_dimsIO[2] = 1; g_dimsIO[3] = hidden_dim;
+  g_dimsGamma1D[0] = hidden_dim;
+
+  // Allocate gamma (internal)
+  if (!allocIonBuffer(gamma_bytes, 0, g_ionGamma)) {
+    printf("[NPU] Failed to alloc ION gamma\n"); return false;
+  }
+  uint16_t one = float_to_half(1.0f);
+  uint16_t* gp = reinterpret_cast<uint16_t*>(g_ionGamma.ptr);
+  for (int i = 0; i < hidden_dim; ++i) gp[i] = one;
+
+  // dlopen QNN backend
+  g_libHandle = dlopen("libQnnHtp.so", RTLD_NOW | RTLD_LOCAL);
+  if (!g_libHandle) { printf("[NPU] dlopen failed: %s\n", dlerror()); return false; }
+
+  using GetProvidersFn = decltype(&QnnInterface_getProviders);
+  auto getProviders = reinterpret_cast<GetProvidersFn>(
+      dlsym(g_libHandle, "QnnInterface_getProviders"));
+  if (!getProviders) { printf("[NPU] getProviders not found\n"); return false; }
+
+  const QnnInterface_t** providers = nullptr;
+  uint32_t numProviders = 0;
+  if (getProviders(&providers, &numProviders) != QNN_SUCCESS || numProviders == 0) {
+    printf("[NPU] No providers\n"); return false;
+  }
+
+  const QnnInterface_t* best = nullptr;
+  for (uint32_t i = 0; i < numProviders; ++i) {
+    if (!providers[i]) continue;
+    if (providers[i]->apiVersion.coreApiVersion.major == QNN_API_VERSION_MAJOR) {
+      if (!best || providers[i]->apiVersion.coreApiVersion.minor >
+                       best->apiVersion.coreApiVersion.minor)
+        best = providers[i];
+    }
+  }
+  if (!best) best = providers[0];
+  g_qnn = &best->QNN_INTERFACE_VER_NAME;
+
+  if (g_qnn->logCreate)
+    g_qnn->logCreate(qnnLogCallback, QNN_LOG_LEVEL_ERROR, &g_log);
+
+  if (!check(g_qnn->backendCreate(g_log, nullptr, &g_backend), "backendCreate"))
+    return false;
+
+  // Register custom op package
+  if (!check(g_qnn->backendRegisterOpPackage(g_backend,
+      "libQnnHtpFlagPollRmsNormOpPackage.so",
+      "flagpollRmsnormInterfaceProvider", "CPU"),
+      "registerOpPackage(CPU)"))
+    return false;
+  if (!check(g_qnn->backendRegisterOpPackage(g_backend,
+      "htp/libQnnHtpFlagPollRmsNormOpPackage.so",
+      "flagpollRmsnormInterfaceProvider", "HTP"),
+      "registerOpPackage(HTP)"))
+    return false;
+
+  if (g_qnn->deviceCreate) {
+    auto s = g_qnn->deviceCreate(nullptr, nullptr, &g_device);
+    if (s != QNN_SUCCESS && s != QNN_DEVICE_ERROR_UNSUPPORTED_FEATURE) {
+      printf("[NPU] deviceCreate failed: %lu\n", (unsigned long)s); return false;
+    }
+  }
+
+  setHighPerformanceMode();
+
+  if (!check(g_qnn->contextCreate(g_backend, g_device, nullptr, &g_context), "contextCreate"))
+    return false;
+
+  g_coreCount = queryCoreCount();
+
+  // Register external ION buffers: input, output, flag, poll_count
+  if (!registerBuffer(ion_input,      g_dimsIO,     kTensorRank, QNN_DATATYPE_FLOAT_16, g_regInput) ||
+      !registerBuffer(ion_output,     g_dimsIO,     kTensorRank, QNN_DATATYPE_FLOAT_16, g_regOutput) ||
+      !registerBuffer(ion_flag,       g_dimsFlagIO, kTensorRank, QNN_DATATYPE_UINT_32,  g_regFlag) ||
+      !registerBuffer(ion_poll_count, g_dimsFlagIO, kTensorRank, QNN_DATATYPE_UINT_32,  g_regPollCount))
+    return false;
+
+  if (!buildGraph())
+    return false;
+
+  // Bind registered memory handles
+  // execInputs: [0]=data, [1]=flag
+  g_execInputs[0].v1.memType   = QNN_TENSORMEMTYPE_MEMHANDLE;
+  g_execInputs[0].v1.memHandle = g_regInput.handle;
+  g_execInputs[1].v1.memType   = QNN_TENSORMEMTYPE_MEMHANDLE;
+  g_execInputs[1].v1.memHandle = g_regFlag.handle;
+  // execOutputs: [0]=result, [1]=poll_count
+  g_execOutputs[0].v1.memType   = QNN_TENSORMEMTYPE_MEMHANDLE;
+  g_execOutputs[0].v1.memHandle = g_regOutput.handle;
+  g_execOutputs[1].v1.memType   = QNN_TENSORMEMTYPE_MEMHANDLE;
+  g_execOutputs[1].v1.memHandle = g_regPollCount.handle;
+
+  return true;
+}
+
 double npu_execute_blocking() {
   double t0 = now_us();
-  g_qnn->graphExecute(g_graph, g_execInputs, 1, g_execOutputs, 1, nullptr, nullptr);
+  g_qnn->graphExecute(g_graph,
+                       g_execInputs,  g_numExecInputs,
+                       g_execOutputs, g_numExecOutputs,
+                       nullptr, nullptr);
   double t1 = now_us();
   return t1 - t0;
+}
+
+uint32_t npu_get_last_poll_count() {
+  if (!g_pollCountPtr) return 0;
+  uint32_t val;
+  memcpy(&val, g_pollCountPtr, sizeof(val));
+  return val;
 }
 
 void npu_cleanup() {
@@ -375,4 +573,9 @@ void npu_cleanup() {
 
   freeIonBuffer(g_ionGamma);
   freeIonBuffer(g_ionBeta);
+
+  g_flagpollMode = false;
+  g_pollCountPtr = nullptr;
+  g_numExecInputs = 1;
+  g_numExecOutputs = 1;
 }

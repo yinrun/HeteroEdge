@@ -284,6 +284,49 @@ static PipelineResult run_fast_sync(int num_steps, int usleep_hint, int npu_core
   return result;
 }
 
+// ── Mode 5: NPU Poll (NPU-side HVX flag polling, GPU+NPU concurrent launch) ─
+static PipelineResult run_npu_poll(int num_steps) {
+  PipelineResult result;
+  result.steps.reserve(num_steps);
+
+  volatile uint32_t* flag_ptr = gpu_get_flag_ptr();
+  if (!flag_ptr) {
+    result.error = "Flag not enabled";
+    return result;
+  }
+
+  double total_t0 = now_us();
+  for (int i = 0; i < num_steps; ++i) {
+    StepTiming st = {};
+    double step_t0 = now_us();
+
+    // Reset flag (CPU side) before GPU starts
+    *flag_ptr = 0;
+
+    // GPU: non-blocking submit (clEnqueue + clFlush, will write flag=1 on completion)
+    gpu_submit();
+    double gpu_submit_t = now_us();
+
+    // NPU: blocking graphExecute with custom FlagPoll op
+    // The HVX kernel internally polls the flag, then computes RMSNorm.
+    // NPU RPC dispatch overlaps with GPU execution!
+    double npu_wall = npu_execute_blocking();
+
+    // When NPU returns, BOTH GPU and NPU are done
+    st.gpu_compute_us = 0;  // no profiling available
+    st.gpu_sync_us = gpu_submit_t - step_t0;  // just submit overhead
+    st.npu_compute_us = npu_wall;  // includes HVX polling + RMSNorm
+    st.npu_sync_us = 0;  // no CPU-side NPU wait
+
+    st.step_total_us = now_us() - step_t0;
+    result.steps.push_back(st);
+  }
+  result.total_us = now_us() - total_t0;
+  result.num_steps = num_steps;
+  result.success = true;
+  return result;
+}
+
 // ── Public API ───────────────────────────────────────────────────────────────
 PipelineResult run_pipeline(const PipelineConfig& config, const char* kernel_path) {
   PipelineResult result;
@@ -312,26 +355,47 @@ PipelineResult run_pipeline(const PipelineConfig& config, const char* kernel_pat
     return result;
   }
 
+  // Allocate flag buffer for modes that need it (FAST_SYNC and NPU_POLL)
+  IonBuffer ion_flag = {};
+  IonBuffer ion_poll_count = {};
+  bool need_flag = (config.mode == SyncMode::FAST_SYNC || config.mode == SyncMode::NPU_POLL);
+
+  if (need_flag) {
+    if (!allocIonBuffer(sizeof(uint32_t), 0, ion_flag)) {
+      result.error = "ION flag alloc failed";
+      gpu_cleanup(); freeIonBuffer(ion_buf0); freeIonBuffer(ion_buf1);
+      return result;
+    }
+  }
+  if (config.mode == SyncMode::NPU_POLL) {
+    if (!allocIonBuffer(sizeof(uint32_t), 0, ion_poll_count)) {
+      result.error = "ION poll_count alloc failed";
+      gpu_cleanup(); freeIonBuffer(ion_buf0); freeIonBuffer(ion_buf1); freeIonBuffer(ion_flag);
+      return result;
+    }
+  }
+
   // Init NPU: reads buf1, writes buf0
-  if (!npu_init(hidden, config.epsilon, ion_buf1, ion_buf0)) {
+  bool npu_ok = false;
+  if (config.mode == SyncMode::NPU_POLL) {
+    // NPU_POLL uses custom FlagPoll RMSNorm op that polls flag internally
+    npu_ok = npu_init_flagpoll(hidden, config.epsilon, ion_buf1, ion_buf0, ion_flag, ion_poll_count);
+  } else {
+    npu_ok = npu_init(hidden, config.epsilon, ion_buf1, ion_buf0);
+  }
+  if (!npu_ok) {
     result.error = "NPU init failed";
     gpu_cleanup(); freeIonBuffer(ion_buf0); freeIonBuffer(ion_buf1);
+    freeIonBuffer(ion_flag); freeIonBuffer(ion_poll_count);
     return result;
   }
 
-  // Allocate flag buffer for FAST_SYNC mode
-  IonBuffer ion_flag = {};
-  if (config.mode == SyncMode::FAST_SYNC) {
-    if (!allocIonBuffer(sizeof(uint32_t), 0, ion_flag)) {
-      result.error = "ION flag alloc failed";
-      npu_cleanup(); gpu_cleanup();
-      freeIonBuffer(ion_buf0); freeIonBuffer(ion_buf1);
-      return result;
-    }
+  if (need_flag) {
     if (!gpu_enable_flag(ion_flag)) {
       result.error = "GPU flag enable failed";
       npu_cleanup(); gpu_cleanup();
-      freeIonBuffer(ion_buf0); freeIonBuffer(ion_buf1); freeIonBuffer(ion_flag);
+      freeIonBuffer(ion_buf0); freeIonBuffer(ion_buf1);
+      freeIonBuffer(ion_flag); freeIonBuffer(ion_poll_count);
       return result;
     }
   }
@@ -344,15 +408,26 @@ PipelineResult run_pipeline(const PipelineConfig& config, const char* kernel_pat
       printf("  WARNING: Failed to pin main thread to core %d\n", config.main_core);
   }
 
-  // Warmup (sequential blocking for all modes, without flag)
-  gpu_disable_flag();
-  for (int i = 0; i < config.num_warmup; ++i) {
-    gpu_execute_blocking(nullptr);
-    npu_execute_blocking();
+  // Warmup
+  if (config.mode == SyncMode::NPU_POLL) {
+    // For NPU_POLL: warmup with flag pre-set to 1 so HVX doesn't block
+    volatile uint32_t* fp = gpu_get_flag_ptr();
+    for (int i = 0; i < config.num_warmup; ++i) {
+      if (fp) *fp = 1;  // pre-set so HVX kernel proceeds immediately
+      gpu_execute_blocking(nullptr);
+      npu_execute_blocking();
+    }
+  } else {
+    // For other modes: sequential blocking warmup without flag
+    gpu_disable_flag();
+    for (int i = 0; i < config.num_warmup; ++i) {
+      gpu_execute_blocking(nullptr);
+      npu_execute_blocking();
+    }
+    // Re-enable flag for FAST_SYNC
+    if (config.mode == SyncMode::FAST_SYNC)
+      gpu_enable_flag(ion_flag);
   }
-  // Re-enable flag for FAST_SYNC
-  if (config.mode == SyncMode::FAST_SYNC)
-    gpu_enable_flag(ion_flag);
 
   // Run pipeline
   switch (config.mode) {
@@ -368,6 +443,9 @@ PipelineResult run_pipeline(const PipelineConfig& config, const char* kernel_pat
     case SyncMode::FAST_SYNC:
       result = run_fast_sync(config.num_steps, config.usleep_hint, config.npu_core);
       break;
+    case SyncMode::NPU_POLL:
+      result = run_npu_poll(config.num_steps);
+      break;
   }
 
   result.avg_step_us = result.total_us / result.num_steps;
@@ -379,6 +457,7 @@ PipelineResult run_pipeline(const PipelineConfig& config, const char* kernel_pat
   freeIonBuffer(ion_buf0);
   freeIonBuffer(ion_buf1);
   freeIonBuffer(ion_flag);
+  freeIonBuffer(ion_poll_count);
 
   return result;
 }

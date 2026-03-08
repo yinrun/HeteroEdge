@@ -15,7 +15,8 @@ enum class SyncMode {
   SEQUENTIAL_BLOCKING,   // clFinish + blocking graphExecute, main thread
   THREADED_CLFINISH,     // NPU in thread, clFinish for GPU, flag for NPU
   EVENT_POLL,            // clFlush + cl_event poll for GPU (driver-level, not paper's approach)
-  FAST_SYNC              // clFlush + shared memory flag poll (paper Section 4.3)
+  FAST_SYNC,             // clFlush + shared memory flag poll (paper Section 4.3)
+  NPU_POLL               // NPU-side HVX flag polling: GPU+NPU launch concurrently
 };
 
 inline const char* sync_mode_name(SyncMode m) {
@@ -24,6 +25,7 @@ inline const char* sync_mode_name(SyncMode m) {
     case SyncMode::THREADED_CLFINISH:   return "Thread+clFinish";
     case SyncMode::EVENT_POLL:          return "Event Poll";
     case SyncMode::FAST_SYNC:           return "Fast Sync";
+    case SyncMode::NPU_POLL:            return "NPU Poll";
   }
   return "Unknown";
 }
